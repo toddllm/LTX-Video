@@ -23,13 +23,33 @@ from ltx_video.pipelines.pipeline_ltx_video import LTXVideoPipeline
 from ltx_video.schedulers.rf import RectifiedFlowScheduler
 from ltx_video.utils.conditioning_method import ConditioningMethod
 
+try:
+    import mlx.core as mx
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+def get_device_and_dtype(device_type="auto"):
+    if device_type == "auto":
+        if torch.cuda.is_available():
+            return "cuda", torch.float32
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            return "cpu", torch.float32  # Force CPU for more stable results
+        elif HAS_MLX:
+            return "mlx", torch.float32
+        else:
+            return "cpu", torch.float32
+    elif device_type == "mps":
+        return "cpu", torch.float32  # Force CPU when MPS is explicitly requested
+    return device_type, torch.float32
+
 
 MAX_HEIGHT = 720
 MAX_WIDTH = 1280
 MAX_NUM_FRAMES = 257
 
 
-def load_vae(vae_dir):
+def load_vae(vae_dir, device, dtype):
     vae_ckpt_path = vae_dir / "vae_diffusion_pytorch_model.safetensors"
     vae_config_path = vae_dir / "config.json"
     with open(vae_config_path, "r") as f:
@@ -37,20 +57,24 @@ def load_vae(vae_dir):
     vae = CausalVideoAutoencoder.from_config(vae_config)
     vae_state_dict = safetensors.torch.load_file(vae_ckpt_path)
     vae.load_state_dict(vae_state_dict)
-    if torch.cuda.is_available():
-        vae = vae.cuda()
-    return vae.to(torch.bfloat16)
+    if device == "cuda":
+        vae = vae.to("cuda")
+        vae = vae.to(torch.bfloat16)
+    else:
+        vae = vae.to('cpu')  # Keep on CPU for MPS
+    return vae
 
-
-def load_unet(unet_dir):
+def load_unet(unet_dir, device, dtype):
     unet_ckpt_path = unet_dir / "unet_diffusion_pytorch_model.safetensors"
     unet_config_path = unet_dir / "config.json"
     transformer_config = Transformer3DModel.load_config(unet_config_path)
     transformer = Transformer3DModel.from_config(transformer_config)
     unet_state_dict = safetensors.torch.load_file(unet_ckpt_path)
     transformer.load_state_dict(unet_state_dict, strict=True)
-    if torch.cuda.is_available():
-        transformer = transformer.cuda()
+    if device == "cuda":
+        transformer = transformer.to("cuda")
+    else:
+        transformer = transformer.to('cpu')  # Keep on CPU for MPS
     return transformer
 
 
@@ -61,7 +85,7 @@ def load_scheduler(scheduler_dir):
 
 
 def load_image_to_tensor_with_resize_and_crop(
-    image_path, target_height=512, target_width=768
+    image_path, target_height=512, target_width=768, device="cuda", dtype=torch.float32
 ):
     image = Image.open(image_path).convert("RGB")
     input_width, input_height = image.size
@@ -80,9 +104,11 @@ def load_image_to_tensor_with_resize_and_crop(
 
     image = image.crop((x_start, y_start, x_start + new_width, y_start + new_height))
     image = image.resize((target_width, target_height))
-    frame_tensor = torch.tensor(np.array(image)).permute(2, 0, 1).float()
+    # Always process on CPU first
+    frame_tensor = torch.tensor(np.array(image), device='cpu', dtype=dtype).permute(2, 0, 1)
     frame_tensor = (frame_tensor / 127.5) - 1.0
-    # Create 5D tensor: (batch_size=1, channels=3, num_frames=1, height, width)
+    if device == "cuda":
+        frame_tensor = frame_tensor.to(device)
     return frame_tensor.unsqueeze(0).unsqueeze(2)
 
 
@@ -166,6 +192,15 @@ def main():
         description="Load models from separate directories and run the pipeline."
     )
 
+    # Add device selection argument
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "mlx", "cpu"],
+        help="Device to run inference on (auto|cuda|mps|mlx|cpu)",
+    )
+
     # Directories
     parser.add_argument(
         "--ckpt_dir",
@@ -247,10 +282,14 @@ def main():
     )
 
     logger = logging.get_logger(__name__)
-
     args = parser.parse_args()
-
     logger.warning(f"Running generation with arguments: {args}")
+
+    device, dtype = get_device_and_dtype(args.device)
+    logger.warning(f"Using device: {device} with dtype: {dtype}")
+
+    if device == "mlx" and not HAS_MLX:
+        raise ImportError("MLX not available. Please install mlx package first.")
 
     seed_everething(args.seed)
 
@@ -261,10 +300,10 @@ def main():
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load image
+    # Load image with device and dtype
     if args.input_image_path:
         media_items_prepad = load_image_to_tensor_with_resize_and_crop(
-            args.input_image_path, args.height, args.width
+            args.input_image_path, args.height, args.width, device, dtype
         )
     else:
         media_items_prepad = None
@@ -292,7 +331,7 @@ def main():
     if media_items_prepad is not None:
         media_items = F.pad(
             media_items_prepad, padding, mode="constant", value=-1
-        )  # -1 is the value for padding since the image is normalized to -1, 1
+        )
     else:
         media_items = None
 
@@ -302,22 +341,25 @@ def main():
     vae_dir = ckpt_dir / "vae"
     scheduler_dir = ckpt_dir / "scheduler"
 
-    # Load models
-    vae = load_vae(vae_dir)
-    unet = load_unet(unet_dir)
+    # Load models with device and dtype
+    vae = load_vae(vae_dir, device, dtype)
+    unet = load_unet(unet_dir, device, dtype)
     scheduler = load_scheduler(scheduler_dir)
     patchifier = SymmetricPatchifier(patch_size=1)
+    
     text_encoder = T5EncoderModel.from_pretrained(
         "PixArt-alpha/PixArt-XL-2-1024-MS", subfolder="text_encoder"
-    )
-    if torch.cuda.is_available():
-        text_encoder = text_encoder.to("cuda")
+    ).to(device).to(dtype)
+    
     tokenizer = T5Tokenizer.from_pretrained(
         "PixArt-alpha/PixArt-XL-2-1024-MS", subfolder="tokenizer"
     )
 
-    if args.bfloat16 and unet.dtype != torch.bfloat16:
+    # Only apply bfloat16 for CUDA
+    if args.bfloat16 and device == "cuda":
         unet = unet.to(torch.bfloat16)
+        vae = vae.to(torch.bfloat16)
+        text_encoder = text_encoder.to(torch.bfloat16)
 
     # Use submodels for the pipeline
     submodel_dict = {
@@ -330,8 +372,15 @@ def main():
     }
 
     pipeline = LTXVideoPipeline(**submodel_dict)
-    if torch.cuda.is_available():
-        pipeline = pipeline.to("cuda")
+    pipeline = pipeline.to(device)
+
+    # Prepare generator based on device
+    if device == "cuda":
+        generator = torch.Generator(device="cuda").manual_seed(args.seed)
+    elif device == "mps":
+        generator = torch.Generator(device="cpu").manual_seed(args.seed)  # MPS doesn't support Generator
+    else:
+        generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     # Prepare input for the pipeline
     sample = {
@@ -342,9 +391,8 @@ def main():
         "media_items": media_items,
     }
 
-    generator = torch.Generator(
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    ).manual_seed(args.seed)
+   # Ensure mixed precision is off for CPU/MPS
+    mixed_precision = not args.bfloat16 if device == "cuda" else False
 
     images = pipeline(
         num_inference_steps=args.num_inference_steps,
@@ -365,7 +413,7 @@ def main():
             if media_items is not None
             else ConditioningMethod.UNCONDITIONAL
         ),
-        mixed_precision=not args.bfloat16,
+        mixed_precision=mixed_precision,
     ).images
 
     # Crop the padded images to the desired resolution and number of frames
